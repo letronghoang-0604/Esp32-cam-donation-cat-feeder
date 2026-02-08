@@ -1,0 +1,337 @@
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <WebServer.h>
+#include "index_html.h"
+#include "esp_http_server.h"
+#include <ESP32Servo.h>
+#define CAMERA_MODEL_AI_THINKER
+#include "camera_pins.h"
+#include "FS.h"
+#include "SPIFFS.h"
+#include <ArduinoJson.h>
+#include <HTTPClient.h>
+#include <Preferences.h>
+#include <deque>
+
+Preferences prefs;
+File fsUploadFile;
+
+// ======= CẤU HÌNH =======
+const char* ssid = "T4";
+const char* password = "12345678";
+String api_token = "YOUR api_token";
+String accountNumber = "YOUR accountNumber";
+
+#define SERVO_PIN 13
+#define TRIG_PIN 14
+#define ECHO_PIN 15
+Servo camServo;
+
+String servoTimes[3];
+std::deque<String> donorList;
+unsigned long lastCheck = 0;
+const unsigned long checkInterval = 6000;
+String lastTransactionDate = "";
+
+WebServer server(80);
+httpd_handle_t stream_httpd = NULL;
+
+// ======= NGƯỠNG HỘP =======
+const float BOX_HEIGHT = 20.0; // cm
+float lastFoodPercent = 0;
+
+// ======= HÀM KHAI BÁO =======
+void handleSetServoTimes();
+void loadServoTimesFromPrefs();
+void saveServoTimesToPrefs();
+void checkSEPAY();
+void startCameraServer();
+void handleFileUpload();
+float readDistanceCM();
+
+// ======= STREAM CAMERA =======
+esp_err_t stream_handler(httpd_req_t *req) {
+  camera_fb_t *fb = NULL;
+  esp_err_t res = httpd_resp_set_type(req, "multipart/x-mixed-replace; boundary=frame");
+  while (true) {
+    fb = esp_camera_fb_get();
+    if (!fb) continue;
+    char buf[64];
+    size_t len = snprintf(buf, 64,
+      "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", fb->len);
+    res = httpd_resp_send_chunk(req, buf, len);
+    res = httpd_resp_send_chunk(req, (const char*)fb->buf, fb->len);
+    res = httpd_resp_send_chunk(req, "\r\n", 2);
+    esp_camera_fb_return(fb);
+    if (res != ESP_OK) break;
+  }
+  return res;
+}
+
+void startCameraServer() {
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  config.server_port = 81;
+  httpd_uri_t stream_uri = { .uri="/stream", .method=HTTP_GET, .handler=stream_handler, .user_ctx=NULL };
+  if (httpd_start(&stream_httpd, &config) == ESP_OK)
+    httpd_register_uri_handler(stream_httpd, &stream_uri);
+}
+
+// ======= SETUP =======
+void setup() {
+  Serial.begin(115200);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  // ===== IP TĨNH =====
+  IPAddress local_IP(192, 168, 1, 200);
+  IPAddress gateway(192, 168, 1, 1);
+  IPAddress subnet(255, 255, 255, 0);
+  IPAddress primaryDNS(8, 8, 8, 8);
+  IPAddress secondaryDNS(8, 8, 4, 4);
+
+  if (!WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS)) {
+    Serial.println("Cấu hình IP tĩnh thất bại!");
+  }
+
+  // ===== WIFI =====
+  WiFi.begin(ssid, password);
+  Serial.print(" Đang kết nối WiFi");
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  Serial.println("\n WiFi connected");
+  Serial.print(" IP Address: "); Serial.println(WiFi.localIP());
+
+  // ===== NTP TIME =====
+  configTime(7 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+  Serial.println(" Đang đồng bộ thời gian...");
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) Serial.println(" Không lấy được thời gian NTP");
+  else Serial.println(" Đồng bộ thời gian thành công");
+
+  // ===== SERVO =====
+  camServo.attach(SERVO_PIN);
+  camServo.write(90);
+
+  // ===== LƯU DỮ LIỆU =====
+  prefs.begin("servo", false);
+  loadServoTimesFromPrefs();
+
+  // ===== CAMERA INIT =====
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.frame_size = FRAMESIZE_QVGA;
+  config.jpeg_quality = 12;
+  config.fb_count = 2;
+  if (esp_camera_init(&config) != ESP_OK) {
+    Serial.println(" Camera init failed");
+    return;
+  }
+
+  SPIFFS.begin(true);
+
+  // ===== WEB =====
+  server.on("/", HTTP_GET, []() {
+    String html(index_html);
+    html.replace("%IP%", WiFi.localIP().toString());
+    server.send(200, "text/html", html);
+  });
+
+  server.on("/setServoTimes", HTTP_GET, handleSetServoTimes);
+
+  server.on("/donors", HTTP_GET, []() {
+    String json = "[";
+    for (size_t i = 0; i < donorList.size(); ++i) {
+      json += "\"" + donorList[i] + "\"";
+      if (i < donorList.size() - 1) json += ",";
+    }
+    json += "]";
+    server.send(200, "application/json", json);
+  });
+
+  server.on("/upload", HTTP_POST, []() {
+    server.send(200, "text/plain", " Ảnh QR đã tải lên thành công!");
+  }, handleFileUpload);
+
+  server.on("/uploaded.jpg", HTTP_GET, []() {
+    File file = SPIFFS.open("/uploaded.jpg", "r");
+    if (!file) { server.send(404, "text/plain", " Chưa có ảnh QR!"); return; }
+    server.streamFile(file, "image/jpeg");
+    file.close();
+  });
+
+  server.on("/delete", HTTP_GET, []() {
+    if (SPIFFS.exists("/uploaded.jpg")) {
+      SPIFFS.remove("/uploaded.jpg");
+      server.send(200, "text/plain", " Ảnh QR đã xóa!");
+    } else server.send(404, "text/plain", " Không tìm thấy ảnh QR!");
+  });
+
+  server.on("/feedLevel", HTTP_GET, []() {
+    server.send(200, "text/plain", String((int)lastFoodPercent));
+  });
+
+  server.begin();
+  startCameraServer();
+  Serial.println(" Web server started!");
+}
+
+// ======= ĐỌC KHOẢNG CÁCH HC-SR04 =======
+float readDistanceCM() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+  return duration * 0.0343 / 2;
+}
+
+// ======= LOAD / SAVE SERVO TIME =======
+void loadServoTimesFromPrefs() {
+  for (int i = 0; i < 3; i++) {
+    String key = "time" + String(i + 1);
+    servoTimes[i] = prefs.getString(key.c_str(), "");
+    if (servoTimes[i] != "") Serial.println(" Loaded " + key + ": " + servoTimes[i]);
+  }
+}
+
+void saveServoTimesToPrefs() {
+  for (int i = 0; i < 3; i++) {
+    String key = "time" + String(i + 1);
+    prefs.putString(key.c_str(), servoTimes[i]);
+    Serial.println(" Saved " + key + ": " + servoTimes[i]);
+  }
+}
+
+void handleSetServoTimes() {
+  bool updated = false;
+  for (int i = 0; i < 3; i++) {
+    String argName = "time" + String(i + 1);
+    if (server.hasArg(argName)) {
+      servoTimes[i] = server.arg(argName);
+      updated = true;
+    }
+  }
+  if (updated) {
+    saveServoTimesToPrefs();
+    server.send(200, "text/plain", " Đã lưu 3 khung giờ thành công!");
+  } else {
+    server.send(400, "text/plain", " Thiếu tham số time1, time2, time3");
+  }
+}
+
+// ======= UPLOAD ẢNH QR =======
+void handleFileUpload() {
+  HTTPUpload& upload = server.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    if (SPIFFS.exists("/uploaded.jpg")) SPIFFS.remove("/uploaded.jpg");
+    fsUploadFile = SPIFFS.open("/uploaded.jpg", FILE_WRITE);
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (fsUploadFile) fsUploadFile.write(upload.buf, upload.currentSize);
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (fsUploadFile) fsUploadFile.close();
+  }
+}
+
+// ======= LOOP =======
+void loop() {
+  server.handleClient();
+
+  // Đo mức thức ăn mỗi 2 giây
+  static unsigned long lastSensor = 0;
+  if (millis() - lastSensor > 2000) {
+    lastSensor = millis();
+    float distance = readDistanceCM();
+    float foodHeight = BOX_HEIGHT - distance;
+    if (foodHeight < 0) foodHeight = 0;
+    lastFoodPercent = (foodHeight / BOX_HEIGHT) * 100.0;
+    Serial.printf(" Mức thức ăn: %.1f cm (%.0f%%)\n", foodHeight, lastFoodPercent);
+  }
+
+  // Kiểm tra donate
+  if (millis() - lastCheck > checkInterval) {
+    lastCheck = millis();
+    checkSEPAY();
+  }
+
+  // Kiểm tra hẹn giờ servo
+  static String lastTriggered = "";
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo)) {
+    char nowHM[6];
+    sprintf(nowHM, "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
+    String currentTime = String(nowHM);
+
+    for (int i = 0; i < 3; i++) {
+      if (servoTimes[i] != "") {
+        String setTime = servoTimes[i].substring(0, 5);
+        if (currentTime == setTime && lastTriggered != currentTime + String(i)) {
+          Serial.println(" Đến giờ " + servoTimes[i] + " → Servo quay!");
+          camServo.write(0);
+          delay(1000);
+          camServo.write(90);
+          lastTriggered = currentTime + String(i);
+        }
+      }
+    }
+  }
+}
+
+// ======= KIỂM TRA SEPAY =======
+void checkSEPAY() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  HTTPClient http;
+  String apiUrl = "https://my.sepay.vn/userapi/transactions/list?account_number=" + accountNumber + "&limit=5";
+  http.begin(apiUrl);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Authorization", "Bearer " + api_token);
+  int httpCode = http.GET();
+
+  if (httpCode == 200) {
+    String payload = http.getString();
+    StaticJsonDocument<2048> doc;
+    if (deserializeJson(doc, payload)) return;
+    JsonArray transactions = doc["transactions"].as<JsonArray>();
+    if (transactions.size() == 0) return;
+
+    String newDate = transactions[0]["transaction_date"].as<String>();
+    if (newDate != lastTransactionDate) {
+      lastTransactionDate = newDate;
+      donorList.clear();
+      for (JsonObject t : transactions) {
+        String content = t["transaction_content"].as<String>();
+        int s = content.indexOf("IBFT ");
+        int e = content.indexOf(" chuyen tien");
+        String name = (s != -1 && e != -1 && e > s) ? content.substring(s + 5, e) : "Ẩn danh";
+        donorList.push_back(name);
+      }
+      while (donorList.size() > 5) donorList.pop_back();
+
+      Serial.println(" Có donate mới → Servo quay!");
+      camServo.write(0);
+      delay(1000);
+      camServo.write(90);
+    }
+  } else {
+    Serial.printf("HTTP lỗi: %d\n", httpCode);
+  }
+  http.end();
+}
