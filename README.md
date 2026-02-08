@@ -48,7 +48,6 @@ It uses an **ESP32-CAM** as the main controller and web server, a **servo** to o
 
 Default pin definitions (from the sketch):
 
-```cpp
 #define SERVO_PIN 13
 Camera pins are defined via #define CAMERA_MODEL_AI_THINKER and #include "camera_pins.h".
 Software & Tools
