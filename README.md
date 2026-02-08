@@ -52,39 +52,22 @@ Default pin definitions (from the sketch):
 #define SERVO_PIN 13
 Camera pins are defined via #define CAMERA_MODEL_AI_THINKER and #include "camera_pins.h".
 Software & Tools
-
 Platform: Arduino core for ESP32
-
 Main libraries:
-
 esp_camera.h – ESP32-CAM camera driver
-
-WiFi.h – Wi-Fi connectivity
-
+WiFi.h – Wi-Fi connectivit
 WebServer.h and esp_http_server.h – HTTP server and MJPEG stream
-
 FS.h and SPIFFS.h – filesystem for uploads
-
 ArduinoJson.h – parsing JSON from the SEPAY API
-
 HTTPClient.h – HTTP client to call SEPAY REST API
-
 Preferences.h – persistent storage (NVS) for feeding times
-
 ESP32Servo.h – servo control
-
 C++ <deque> – storing donor names
-
 Time sync:
-
 configTime() with NTP servers (pool.ntp.org, time.nist.gov) to get real time for feeding schedule.
-
 IDE:
-
 Arduino IDE, PlatformIO or VS Code with ESP32 support.
-
 ⚠️ Before publishing to GitHub, replace your real ssid, password, api_token and accountNumber with placeholders or move them into a separate secrets.h file.
-
 Project Structure
 esp32-cam-donation-cat-feeder/
 ├─ code/
@@ -96,13 +79,6 @@ esp32-cam-donation-cat-feeder/
 
 Getting the Web UI Source (index_html.h)
 
-For the full web dashboard source code (index_html.h), please contact me directly:
-
-Email: your_email@example.com
-
-Zalo: 0xxx xxx xxx
-
-I will be happy to share the index_html.h file and instructions on how to integrate it into the project.
 
 Code Overview
 1. cat_feeder_cam.ino (ESP32-CAM main controller)
@@ -220,5 +196,9 @@ The device checks current HH:MM against the saved servoTimes.
 When a match is found for a given slot and it hasn’t been triggered yet that minute:
 The servo rotates to dispense food and then returns to the idle angle.
 This makes the ESP32-CAM Donation-Based Cat Feeder capable of both scheduled feeding and donation-triggered feeding, with live video monitoring, donor list, and food level feedback through a simple web interface.
-#define TRIG_PIN 14
-#define ECHO_PIN 15
+
+For the full web dashboard source code (index_html.h), please contact me directly:
+Email: letronghoang0604@gmail.com
+Zalo: 0903240604
+I will be happy to share the index_html.h file and instructions on how to integrate it into the project.
+
